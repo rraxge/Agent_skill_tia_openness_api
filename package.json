@@ -1,0 +1,9 @@
+{
+  "name": "tia-openness-api",
+  "version": "1.0.0",
+  "description": "TIA Portal Openness API automation: create/open projects, import/export PLC blocks, manage tag tables, write LAD/SCL XML",
+  "main": "SKILL.md",
+  "keywords": ["siemens", "tia-portal", "openness", "plc", "automation"],
+  "author": "woU4_FHwAAxfMc7qYjfXbNrnD7lUDbpA",
+  "license": "MIT"
+}
