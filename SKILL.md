@@ -25,9 +25,9 @@ description: "TIA Portal Openness API automation skill. Invoke when user asks to
 
 ## SDK Module
 
-Core module: `$env:LOCALAPPDATA\hermes\skills\openclaw\tia-openness-api\TiaPortalSDK.ps1`
+Core module: `<技能目录>\TiaPortalSDK.ps1`（与 SKILL.md 同目录，整个技能包可克隆到任意位置）
 
-Load with dot-source: `. "$env:LOCALAPPDATA\hermes\skills\openclaw\tia-openness-api\TiaPortalSDK.ps1"`
+Load with dot-source: `. "<技能目录>\TiaPortalSDK.ps1"`
 
 ### Available Functions
 
@@ -84,7 +84,7 @@ Load with dot-source: `. "$env:LOCALAPPDATA\hermes\skills\openclaw\tia-openness-
 ### Quick Usage Patterns
 
 ```powershell
-. "$env:LOCALAPPDATA\hermes\skills\openclaw\tia-openness-api\TiaPortalSDK.ps1"
+. "<技能目录>\TiaPortalSDK.ps1"
 
 Connect-TiaPortal
 Get-TiaProject

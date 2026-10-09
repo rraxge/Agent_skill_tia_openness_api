@@ -138,7 +138,9 @@ Disconnect-TiaPortal
 
 ## 作为 Agent Skill 使用
 
-此 Skill 供 OpenClaw AI Agent 调用。Agent 通过 `SKILL.md` 中的详细指导来理解和执行 TIA Portal 自动化任务。SKILL.md 包含：
+本 Skill 是一个纯文本 + PowerShell 脚本的包，**不绑定任何特定的 Agent 框架**：
+把 `SKILL.md` 作为上下文交给你的编码助手即可（也可以直接调用 `TiaPortalSDK.ps1`，
+或用 `scripts/verify-e2e.ps1` 跑端到端验证）。SKILL.md 包含：
 
 - 所有 SDK 函数的完整说明
 - 底层反射 API 调用示例
