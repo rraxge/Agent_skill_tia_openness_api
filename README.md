@@ -24,7 +24,7 @@ Siemens TIA Portal 自动化技能（支持 **V19 / V20 / V21**）— 通过 Ope
 - **PowerShell 5.1+（64 位）**
 - DLL 路径**不写死**，从 `HKLM\SOFTWARE\Siemens\Automation\Openness\<ver>\PublicAPI\` 自动发现
   - V19：`C:\Program Files\Siemens\Automation\Portal V19\PublicAPI\V19\Siemens.Engineering.dll`
-  - V21：本机在 `D:\Siemens\Portal V21\PublicAPI\V21\net48\Siemens.Engineering.Base.dll` —— V21 拆成 `Base` / `Step7` / `WinCC` / ... 多个程序集，且多一层 `net48` 目录
+  - V21：例 `D:\Siemens\Portal V21\PublicAPI\V21\net48\Siemens.Engineering.Base.dll`（盘符按实际安装位置） —— V21 拆成 `Base` / `Step7` / `WinCC` / ... 多个程序集，且多一层 `net48` 目录
 
 ## 快速开始
 

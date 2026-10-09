@@ -1370,15 +1370,17 @@ function Find-TiaProjects {
         [int]$MaxDepth = 5
     )
     if (-not $SearchDirs) {
+        # 通用默认搜索目录。要个性化请设环境变量 TIA_PROJECT_SEARCH_DIRS(分号分隔), 例如:
+        #   [Environment]::SetEnvironmentVariable('TIA_PROJECT_SEARCH_DIRS','D:\我的工程;E:\PLC','User')
         $SearchDirs = @(
-            'D:\工作',
-            'D:\work',
             'D:\Projects',
+            'D:\work',
             'D:\Siemens',
-            'D:\SeedBox_Project',
-            'D:\new folder',
-            [System.IO.Path]::Combine($env:USERPROFILE, 'Documents', 'Automation')
+            (Join-Path $env:USERPROFILE 'Documents\Automation')
         )
+        if ($env:TIA_PROJECT_SEARCH_DIRS) {
+            $SearchDirs = @($env:TIA_PROJECT_SEARCH_DIRS.Split(';') | Where-Object { "$_".Trim() -ne '' })
+        }
     }
     $results = @()
     # 按本机实际安装的版本决定扫描哪些工程扩展名 (ap19 / ap21 ...)

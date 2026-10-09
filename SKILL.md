@@ -11,7 +11,7 @@ description: "TIA Portal Openness API automation skill. Invoke when user asks to
 
 | 项 | V19 及以前 | V21 起 |
 |---|---|---|
-| 安装位置 | `C:\Program Files\Siemens\Automation\Portal V19\` | 本机实际在 `D:\Siemens\Portal V21\`（**不一定在 C 盘，别硬编码**） |
+| 安装位置 | `C:\Program Files\Siemens\Automation\Portal V19\` | 可装在任意盘（例：`D:\Siemens\Portal V21\`）；**别硬编码，从注册表发现** |
 | Openness 程序集 | 单个 `Siemens.Engineering.dll` | 拆成多个：`Base` / `Step7` / `WinCC` / `WinCCUnified` / `Safety` / `Startdrive` / `TeamcenterGateway` |
 | 主程序集 | `...\PublicAPI\V19\Siemens.Engineering.dll` | `...\PublicAPI\V21\net48\Siemens.Engineering.Base.dll`（**多一层 TFM 目录**） |
 | 程序集签名 | `PublicKeyToken=d29ec89bac048f84` | `PublicKeyToken=29bfe5fdf4ba5d3b` |
@@ -25,9 +25,9 @@ description: "TIA Portal Openness API automation skill. Invoke when user asks to
 
 ## SDK Module
 
-Core module: `C:\Users\Administrator\AppData\Local\hermes\skills\openclaw\tia-openness-api\TiaPortalSDK.ps1`
+Core module: `$env:LOCALAPPDATA\hermes\skills\openclaw\tia-openness-api\TiaPortalSDK.ps1`
 
-Load with dot-source: `. "C:\Users\Administrator\AppData\Local\hermes\skills\openclaw\tia-openness-api\TiaPortalSDK.ps1"`
+Load with dot-source: `. "$env:LOCALAPPDATA\hermes\skills\openclaw\tia-openness-api\TiaPortalSDK.ps1"`
 
 ### Available Functions
 
@@ -84,7 +84,7 @@ Load with dot-source: `. "C:\Users\Administrator\AppData\Local\hermes\skills\ope
 ### Quick Usage Patterns
 
 ```powershell
-. "C:\Users\Administrator\AppData\Local\hermes\skills\openclaw\tia-openness-api\TiaPortalSDK.ps1"
+. "$env:LOCALAPPDATA\hermes\skills\openclaw\tia-openness-api\TiaPortalSDK.ps1"
 
 Connect-TiaPortal
 Get-TiaProject
@@ -101,7 +101,7 @@ Disconnect-TiaPortal
 
 ## Environment & Connection
 
-- DLL: **不写死**。用 `Get-TiaInstallations` 从注册表发现（V21 在本机是 `D:\Siemens\Portal V21\PublicAPI\V21\net48\Siemens.Engineering.Base.dll`）
+- DLL: **不写死**。用 `Get-TiaInstallations` 从注册表发现（V21 例：`D:\Siemens\Portal V21\PublicAPI\V21\net48\Siemens.Engineering.Base.dll`，盘符按实际安装位置）
 - 注册表根：`HKLM\SOFTWARE\Siemens\Automation\Openness\<ver>\PublicAPI\`
   - V21 形状：`\<apiVer>\net48\` → `Siemens.Engineering.Base = <dll 路径>`
   - V19 形状：`\<apiVer>\` 直接挂 DLL 值，**没有 **`net48`** 层**；且同一次安装会登记 `16.0.0.0`…`19.0.0.0` 多个 apiVer
@@ -119,7 +119,7 @@ Get-TiaType 'Siemens.Engineering.SW.PlcSoftware'   # => Siemens.Engineering.Step
 ```
 
 ```powershell
-$dllPath = 'D:\Siemens\Portal V21\PublicAPI\V21\net48\Siemens.Engineering.Base.dll'
+$dllPath = 'D:\Siemens\Portal V21\PublicAPI\V21\net48\Siemens.Engineering.Base.dll'   # 盘符按实际安装位置改
 $asm = [System.Reflection.Assembly]::LoadFrom($dllPath)
 
 $modeType = Get-TiaType 'Siemens.Engineering.TiaPortalMode'
@@ -1126,8 +1126,8 @@ V19 uses `Project.Archive(DirectoryInfo, String, ProjectArchivationMode)` — NO
 $archivationModeType = $asm.GetType('Siemens.Engineering.ProjectArchivationMode')
 $compressed = [System.Enum]::Parse($archivationModeType, 'Compressed')
 
-$targetDir = New-Object System.IO.DirectoryInfo('C:\Users\Administrator\.openclaw\workspace')
-$project.Archive($targetDir, 'SeedBox_Control', $compressed)   # 产物: C:\Users\Administrator\.openclaw\workspace\SeedBox_Control.zap19
+$targetDir = New-Object System.IO.DirectoryInfo('D:\Archive')
+$project.Archive($targetDir, 'MyProject', $compressed)   # 产物: D:\Archive\MyProject.zap19
 Write-Host 'Project archived successfully'
 ```
 
@@ -1143,9 +1143,9 @@ Write-Host 'Project archived successfully'
 V19 uses `ProjectComposition.Retrieve()` — NOT `Restore()`!
 
 ```powershell
-$archivePath = 'C:\Users\Administrator\.openclaw\workspace\SeedBox_Control.zap19'
+$archivePath = 'D:\Archive\MyProject.zap19'
 $archiveFi = New-Object System.IO.FileInfo($archivePath)
-$restoreDir = New-Object System.IO.DirectoryInfo('C:\Users\Administrator\.openclaw\workspace')
+$restoreDir = New-Object System.IO.DirectoryInfo('D:\Archive')
 
 $project = $tiaPortal.Projects.Retrieve($archiveFi, $restoreDir)
 if ($project -is [System.Management.Automation.PSObject]) { $project = $project.BaseObject }
@@ -1226,7 +1226,7 @@ $blocks | Format-Table -AutoSize
 
 ## V21 实测要点（对真实程序集反射枚举验证）
 
-以下是对本机 `D:\Siemens\Portal V21\PublicAPI\V21\net48\` 下每个程序集逐个 `LoadFrom` + `GetExportedTypes()` 枚举得出的结果，不是文档推测。
+以下是实测环境下（V21 的 Openness 目录，例：`D:\Siemens\Portal V21\PublicAPI\V21\net48\`）每个程序集逐个 `LoadFrom` + `GetExportedTypes()` 枚举得出的结果，不是文档推测。
 
 ### 旧工程升级到 V21（自动化，本机实测通过）
 
