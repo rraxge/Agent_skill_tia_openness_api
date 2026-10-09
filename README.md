@@ -1,6 +1,6 @@
-# tia-openness-api
+﻿# tia-openness-api
 
-Siemens TIA Portal V19 自动化技能 — 通过 Openness API 以 PowerShell 脚本实现对 TIA Portal 项目的全自动化操作。
+Siemens TIA Portal 自动化技能（支持 **V19 / V20 / V21**）— 通过 Openness API 以 PowerShell 脚本实现对 TIA Portal 项目的全自动化操作。SDK 从注册表自动发现本机安装的版本，切换版本只需 `Connect-TiaPortal -TiaVersion 21`。
 
 ## 功能概览
 
@@ -20,9 +20,11 @@ Siemens TIA Portal V19 自动化技能 — 通过 Openness API 以 PowerShell �
 ## 系统要求
 
 - **Windows** 10 / Server 2016+
-- **Siemens TIA Portal V19**（已安装 Openness API 组件）
-- **PowerShell 5.1+**
-- DLL 路径：`C:\Program Files\Siemens\Automation\Portal V19\PublicAPI\V19\Siemens.Engineering.dll`
+- **Siemens TIA Portal V19 / V20 / V21**（需已安装 Openness API 组件）
+- **PowerShell 5.1+（64 位）**
+- DLL 路径**不写死**，从 `HKLM\SOFTWARE\Siemens\Automation\Openness\<ver>\PublicAPI\` 自动发现
+  - V19：`C:\Program Files\Siemens\Automation\Portal V19\PublicAPI\V19\Siemens.Engineering.dll`
+  - V21：本机在 `D:\Siemens\Portal V21\PublicAPI\V21\net48\Siemens.Engineering.Base.dll` —— V21 拆成 `Base` / `Step7` / `WinCC` / ... 多个程序集，且多一层 `net48` 目录
 
 ## 快速开始
 
@@ -30,8 +32,9 @@ Siemens TIA Portal V19 自动化技能 — 通过 Openness API 以 PowerShell �
 # 1. 加载 SDK
 . ".\TiaPortalSDK.ps1"
 
-# 2. 连接 TIA Portal（附加或启动）
-Connect-TiaPortal -StartIfNotFound -WithUI
+# 2. 连接 TIA Portal（附加或启动；多版本并存时用 -TiaVersion 指定）
+Get-TiaInstallations | Format-Table Version, Dir -AutoSize
+Connect-TiaPortal -StartIfNotFound -WithUI -TiaVersion 21
 
 # 3. 打开项目
 Get-TiaProject -ProjectPath "D:\Projects\MyProject.ap19"
@@ -54,8 +57,8 @@ Disconnect-TiaPortal
 
 ```
 tia-openness-api/
-├── SKILL.md           # 完整技能文档（~1500行），供 AI Agent 使用
-├── TiaPortalSDK.ps1   # PowerShell SDK 模块（~1000行，40+函数）
+├── SKILL.md           # 完整技能文档（~1700行），含 V21 实测章节
+├── TiaPortalSDK.ps1   # PowerShell SDK 模块（~1060行，49函数，版本自适应 V19/V21）
 ├── package.json       # 包信息
 ├── _meta.json         # 元数据
 └── README.md          # 本文件
@@ -128,6 +131,10 @@ Disconnect-TiaPortal
 3. **地址对齐**：S7-1200/1500 要求 INT 从偶数字节开始 (`%MW0`、`%MW2`)，DINT/Real 从 4 的倍数开始 (`%MD0`、`%MD4`)
 4. **PSObject 包装**：反射调用返回的对象常被 PowerShell 包装为 PSObject，需通过 `.BaseObject` 解包
 5. **设备创建**：含 CPU 的设备必须使用 `CreateWithItem`，OrderNumber 必须包含空格（如 `"OrderNumber:6ES7 214-1AG40-0XB0/V4.5"`）
+6. **V21 跨程序集**：`SW.*`（PlcSoftware / Blocks / Tags）在 `Siemens.Engineering.Step7.dll`，其余在 `Siemens.Engineering.Base.dll`。用 `Get-TiaType` 跨程序集解析，不要对单个程序集调 `GetType()`（V21 下会返回 `$null`）
+7. **PowerShell 参数模式坑**：语句以函数调用开头时不能直接 `.Method()` 链式调用，整串会被当字符串参数；先赋值给变量再调
+8. **XML 版本号**：V19 写 `V19`、V21 写 `V21`（SDK 按当前连接版本自动填 `$script:XmlVersion`）；归档扩展名同理 `.zap19` / `.zap21`
+9. **V21 的 Add-In**：V20 及更早写的 Add-In 在 V21 不可用，需按新的 `Siemens.Engineering.AddIn.*` 机制改造
 
 ## 作为 Agent Skill 使用
 

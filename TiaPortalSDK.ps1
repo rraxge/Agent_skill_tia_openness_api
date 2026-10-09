@@ -1,26 +1,149 @@
-$script:DllPath = 'C:\Program Files\Siemens\Automation\Portal V19\PublicAPI\V19\Siemens.Engineering.dll'
-$script:Asm = $null
-$script:TiaPortal = $null
-$script:Project = $null
-$script:Software = $null
+﻿# ============================================================
+#  TIA Portal Openness SDK - 版本自适应 (V19 / V20 / V21 ...)
+# ------------------------------------------------------------
+#  安装位置从注册表自动发现:
+#     HKLM\SOFTWARE\Siemens\Automation\Openness\<ver>\PublicAPI\<ver>\<tfm>\
+#  V19 及以前: 单个 Siemens.Engineering.dll
+#  V21 起    : 拆成 Siemens.Engineering.Base.dll / .Step7.dll / .WinCC*.dll / ...
+#              Base 必须先加载, 其余程序集才解析得到依赖。
+#  用 Connect-TiaPortal -TiaVersion 21 指定版本; 缺省取本机最高版本。
+# ============================================================
+
+$script:TiaVersion = $null      # '19' / '21'
+$script:DllPath    = $null      # 主程序集 (类型解析兜底)
+$script:DllPaths   = @()        # 本次需要加载的全部 Openness 程序集
+$script:Asm        = $null      # == 主程序集
+$script:XmlVersion = 'V21'      # 写入导入 XML 的 <Engineering version="...">
+$script:ProjectExt = 'ap21'
+$script:ArchiveExt = 'zap21'
+$script:TiaPortal  = $null
+$script:Project    = $null
+$script:Software   = $null
 
 function Unwrap-PSObject {
+    <#  解包 PowerShell 的 PSObject 包装。
+        必须用 -NoEnumerate 输出: 如果传进来的是集合
+        (如 TiaPortal.Projects 这类 ProjectComposition),
+        return 会把集合展开成多个元素 —— 空集合直接变成 $null,
+        非空集合变成里面的元素, 调用方拿到的东西完全不对。  #>
     param($obj)
-    if ($obj -is [System.Management.Automation.PSObject]) { return $obj.BaseObject }
-    return $obj
+    $t = $obj
+    if ($t -is [System.Management.Automation.PSObject]) { $t = $t.BaseObject }
+    Write-Output $t -NoEnumerate
+}
+
+function Get-TiaInstallations {
+    <#  列出本机所有已安装的 TIA Portal Openness 版本。
+        注册表有两种形状, 都要兼容:
+          V21 起: Openness\<ver>\PublicAPI\<apiVer>\net48\Siemens.Engineering.Base = <dll 路径>
+          V19 及以前: Openness\<ver>\PublicAPI\<apiVer>\Siemens.Engineering = <dll 路径>
+        V19 会为同一次安装登记多个 apiVer(16.0.0.0 ... 19.0.0.0),
+        同一 Version 只保留 apiVer 最高的那个。
+        返回对象含 Version / Dir / Primary / Assemblies  #>
+    $best = @{}
+    $root = 'HKLM:\SOFTWARE\Siemens\Automation\Openness'
+    if (-not (Test-Path $root)) { return @() }
+    foreach ($vKey in (Get-ChildItem $root -ErrorAction SilentlyContinue)) {
+        $apiRoot = Join-Path $vKey.PSPath 'PublicAPI'
+        if (-not (Test-Path $apiRoot)) { continue }
+        $cands = @()
+        foreach ($apiKey in (Get-ChildItem $apiRoot -ErrorAction SilentlyContinue)) {
+            $cands += [PSCustomObject]@{ Key = $apiKey.PSPath; ApiVer = $apiKey.PSChildName }
+            foreach ($sfxKey in (Get-ChildItem $apiKey.PSPath -ErrorAction SilentlyContinue)) {
+                $cands += [PSCustomObject]@{ Key = $sfxKey.PSPath; ApiVer = $apiKey.PSChildName }
+            }
+        }
+        foreach ($c in $cands) {
+            $props = Get-ItemProperty $c.Key -ErrorAction SilentlyContinue
+            $dll = $null
+            foreach ($pr in $props.PSObject.Properties) {
+                if ($pr.Name -like 'Siemens.Engineering*' -and "$($pr.Value)" -like '*.dll') { $dll = $pr.Value; break }
+            }
+            if (-not $dll) { continue }
+            $dir = Split-Path $dll -Parent
+            $files = @(Get-ChildItem -Path $dir -Filter 'Siemens.Engineering*.dll' -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Name -notlike '*AddIn*' } | ForEach-Object { $_.FullName })
+            $primary = $files | Where-Object { $_ -like '*Siemens.Engineering.Base.dll' } | Select-Object -First 1
+            if (-not $primary) { $primary = $files | Where-Object { $_ -like '*\Siemens.Engineering.dll' } | Select-Object -First 1 }
+            if (-not $primary) { $primary = $files | Select-Object -First 1 }
+            $ver = $vKey.PSChildName.Split('.')[0]
+            $apiNum = 0.0
+            try { $apiNum = [double]($c.ApiVer -replace '^(\d+\.\d+).*$', '$1') } catch { }
+            if (-not $best.ContainsKey($ver) -or $apiNum -gt $best[$ver].ApiNum) {
+                $best[$ver] = [PSCustomObject]@{
+                    Version    = $ver
+                    Dir        = $dir
+                    Primary    = $primary
+                    Assemblies = $files
+                    ApiNum     = $apiNum
+                }
+            }
+        }
+    }
+    return @($best.Values | Sort-Object { [int]$_.Version } | ForEach-Object { $_ })
+}
+
+function Get-TiaType {
+    <#  跨程序集按全名解析类型。
+        V21 起类型分散在 Base / Step7 / WinCC 等多个程序集,
+        只查单一程序集会漏掉 SW.* 等类型 (返回 $null)。
+        同机装有多版本时, 优先返回本次 Connect 选定版本的程序集里的类型。  #>
+    param([Parameter(Mandatory=$true)][string]$TypeName)
+    if ($script:Asm) {
+        $t = $script:Asm.GetType($TypeName)
+        if ($t) { return $t }
+    }
+    $preferred = @($script:DllPaths | ForEach-Object { "$_".ToLower() })
+    $fallback = $null
+    foreach ($a in [AppDomain]::CurrentDomain.GetAssemblies()) {
+        if ($a.GetName().Name -notlike 'Siemens.Engineering*') { continue }
+        try { $t = $a.GetType($TypeName) } catch { $t = $null }
+        if (-not $t) { continue }
+        $loc = ''
+        try { $loc = "$($a.Location)".ToLower() } catch { }
+        if ($preferred -contains $loc) { return $t }
+        if (-not $fallback) { $fallback = $t }
+    }
+    return $fallback
 }
 
 function Connect-TiaPortal {
     param(
         [switch]$StartIfNotFound,
-        [switch]$WithUI
+        [switch]$WithUI,
+        [string]$TiaVersion      # '19' / '21', 缺省取本机最高版本
     )
-    if (-not (Test-Path $script:DllPath)) {
-        throw "Siemens.Engineering.dll not found at $($script:DllPath)"
+    # --- 发现并选定 Openness 版本 ---
+    $installs = @(Get-TiaInstallations)
+    if (-not $installs) {
+        throw 'No TIA Portal Openness installed (HKLM\SOFTWARE\Siemens\Automation\Openness)'
+    }
+    $pick = if ($TiaVersion) { $installs | Where-Object { $_.Version -eq $TiaVersion } | Select-Object -First 1 }
+            else             { $installs | Select-Object -Last 1 }
+    if (-not $pick) {
+        $have = ($installs | ForEach-Object { 'V' + $_.Version }) -join ', '
+        throw "TIA Portal V$TiaVersion Openness not found. Installed: $have"
+    }
+    $script:TiaVersion = $pick.Version
+    $script:XmlVersion = 'V' + $pick.Version
+    $script:ProjectExt = 'ap' + $pick.Version
+    $script:ArchiveExt = 'zap' + $pick.Version
+    $script:DllPath    = $pick.Primary
+    $script:DllPaths   = @($pick.Assemblies)
+
+    # 逐个加载: V21 起 Base 必须先于 Step7 / WinCC 加载
+    foreach ($dll in ($script:DllPaths | Sort-Object { if ($_ -like '*Siemens.Engineering.Base.dll') { 0 } else { 1 } })) {
+        try { [void][System.Reflection.Assembly]::LoadFrom($dll) }
+        catch { Write-Warning "Load failed: $dll -- $($_.Exception.Message)" }
     }
     $script:Asm = [System.Reflection.Assembly]::LoadFrom($script:DllPath)
-    $modeType = $script:Asm.GetType('Siemens.Engineering.TiaPortalMode')
-    $getProcessesMethod = $script:Asm.GetType('Siemens.Engineering.TiaPortal').GetMethod('GetProcesses', [System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Static)
+    Write-Host "Openness V$($script:TiaVersion) loaded: $($pick.Dir)" -ForegroundColor DarkGray
+
+    $modeType = Get-TiaType('Siemens.Engineering.TiaPortalMode')
+    # 注意: 行首是函数调用时属于参数模式, 不能在后面直接 .Method() 链式调用,
+    #       必须先赋值给变量(或整体加括号), 否则整串会被当成字符串参数。
+    $tpType = Get-TiaType('Siemens.Engineering.TiaPortal')
+    $getProcessesMethod = $tpType.GetMethod('GetProcesses', [System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Static)
     $processes = $getProcessesMethod.Invoke($null, $null)
     $script:TiaPortal = $null
     if ($processes.Count -gt 0) {
@@ -31,7 +154,7 @@ function Connect-TiaPortal {
     } elseif ($StartIfNotFound) {
         $modeValue = if ($WithUI) { 'WithUserInterface' } else { 'WithoutUserInterface' }
         $mode = [System.Enum]::Parse($modeType, $modeValue)
-        $ctor = $script:Asm.GetType('Siemens.Engineering.TiaPortal').GetConstructor(@($modeType))
+        $ctor = $tpType.GetConstructor(@($modeType))
         $script:TiaPortal = Unwrap-PSObject ($ctor.Invoke(@($mode)))
         Start-Sleep -Seconds 15
         Write-Host "Started new TIA Portal ($modeValue)" -ForegroundColor Green
@@ -55,7 +178,8 @@ function Disconnect-TiaPortal {
 
 function Get-TiaProject {
     param(
-        [string]$ProjectPath
+        [string]$ProjectPath,
+        [switch]$Upgrade        # 旧版本工程(.ap19 等)必须用 -Upgrade 走 OpenWithUpgrade
     )
     if (-not $script:TiaPortal) { throw "Not connected. Call Connect-TiaPortal first." }
     
@@ -68,16 +192,24 @@ function Get-TiaProject {
             Write-Host "Using already open project: $($script:Project.Path)" -ForegroundColor Cyan
             return $script:Project
         }
-        # Close the existing project first
-        Write-Host "Closing current project: $($existing.Name)..." -ForegroundColor Yellow
+        # Close the existing project first (先保存, 避免丢掉用户未保存的改动)
+        Write-Host "Closing current project: $($existing.Name) (saving first)..." -ForegroundColor Yellow
+        try { $existing.Save() } catch { Write-Host ("  Save failed: " + $_.Exception.Message) -ForegroundColor Yellow }
         $existing.Close()
         Start-Sleep -Seconds 3
     }
     
     if ($ProjectPath) {
         $fi = New-Object System.IO.FileInfo((Resolve-Path $ProjectPath).Path)
-        Write-Host "Opening project: $ProjectPath ..." -ForegroundColor Yellow
-        $script:Project = $script:TiaPortal.Projects.Open($fi)
+        # 注意: 不要对 Projects 这种集合做 Unwrap —— PowerShell 函数返回会展开集合
+        $projects = $script:TiaPortal.Projects
+        if ($Upgrade) {
+            Write-Host "Opening WITH UPGRADE: $ProjectPath ..." -ForegroundColor Yellow
+            $script:Project = $projects.OpenWithUpgrade($fi)
+        } else {
+            Write-Host "Opening project: $ProjectPath ..." -ForegroundColor Yellow
+            $script:Project = $script:TiaPortal.Projects.Open($fi)
+        }
         if ($script:Project -is [System.Management.Automation.PSObject]) { $script:Project = $script:Project.BaseObject }
         Start-Sleep -Seconds 10
         Write-Host "Opened project: $($script:Project.Path)" -ForegroundColor Green
@@ -103,7 +235,8 @@ function Save-TiaProject {
 
 function Find-TiaPlcSoftware {
     param($item)
-    $softwareContainerType = $script:Asm.GetType('Siemens.Engineering.HW.Features.SoftwareContainer')
+    if ($null -eq $item) { return $null }
+    $softwareContainerType = Get-TiaType('Siemens.Engineering.HW.Features.SoftwareContainer')
     $gsm = $item.GetType().GetMethod('GetService')
     if ($gsm -and $gsm.IsGenericMethod) {
         $gm = $gsm.MakeGenericMethod($softwareContainerType)
@@ -253,7 +386,7 @@ function Export-TiaBlock {
     if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
     $exportPath = Join-Path $OutputDir "$Name.xml"
     $fi = New-Object System.IO.FileInfo($exportPath)
-    $exportOptionsType = $script:Asm.GetType('Siemens.Engineering.ExportOptions')
+    $exportOptionsType = Get-TiaType('Siemens.Engineering.ExportOptions')
     $option = if ($WithDefaults) { [System.Enum]::Parse($exportOptionsType, 'WithDefaults') } else { [System.Enum]::Parse($exportOptionsType, 'AsInterface') }
     $block.Export($fi, $option)
     Write-Host "Exported block '$Name' to $exportPath" -ForegroundColor Green
@@ -268,11 +401,123 @@ function Import-TiaBlock {
     )
     if (-not $script:Software) { throw "No PLC software." }
     $blockGroup = Unwrap-PSObject $script:Software.BlockGroup
-    $importOptionsType = $script:Asm.GetType('Siemens.Engineering.ImportOptions')
+    $importOptionsType = Get-TiaType('Siemens.Engineering.ImportOptions')
     $option = if ($Override) { [System.Enum]::Parse($importOptionsType, 'Override') } else { [System.Enum]::Parse($importOptionsType, 'Keep') }
     $fi = New-Object System.IO.FileInfo($XmlPath)
     $blockGroup.Blocks.Import($fi, $option)
     Write-Host "Imported block from $XmlPath" -ForegroundColor Green
+}
+
+function New-TiaFbXml {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Name,
+        [int]$Number = 0,
+        [string]$ProgrammingLanguage = 'LAD',
+        [string]$Culture = 'zh-CN',
+        [array]$InputMembers,
+        [array]$OutputMembers,
+        [array]$InOutMembers,
+        [array]$StaticMembers,
+        [array]$TempMembers
+    )
+    <#  V21 起 PlcBlockComposition.CreateFB 只接受 ProDiag 语言:
+          "The action \"Create block\" only supports the programming language 'ProDiag'."
+        所以创建 FB 必须走 XML 导入, 本函数生成可导入的 FB XML。
+        FB 的 Section 不含 Return(FB 用 Static 存状态)。  #>
+    function __tiaBuildSec {
+        param($sectionName, $members)
+        if (-not $members -or $members.Count -eq 0) { return "<Section Name=`"$sectionName`" />" }
+        $s = ''
+        foreach ($m in $members) {
+            $acc = if ($m.Accessibility) { " Accessibility=`"$($m.Accessibility)`"" } else { '' }
+            $s += "<Member Name=`"$([System.Security.SecurityElement]::Escape($m.Name))`" Datatype=`"$($m.Datatype)`"$acc />"
+        }
+        return "<Section Name=`"$sectionName`">$s</Section>"
+    }
+    $secInput  = __tiaBuildSec 'Input'    $InputMembers
+    $secOutput = __tiaBuildSec 'Output'   $OutputMembers
+    $secInOut  = __tiaBuildSec 'InOut'    $InOutMembers
+    $secStatic = __tiaBuildSec 'Static'   $StaticMembers
+    $secTemp   = __tiaBuildSec 'Temp'     $TempMembers
+    $xml = @"
+<?xml version="1.0" encoding="utf-8"?>
+<Document>
+  <Engineering version="$script:XmlVersion" />
+  <SW.Blocks.FB ID="0">
+    <AttributeList>
+      <AutoNumber>true</AutoNumber>
+      <HeaderAuthor />
+      <HeaderFamily />
+      <HeaderName />
+      <HeaderVersion>0.1</HeaderVersion>
+      <Interface><Sections xmlns="http://www.siemens.com/automation/Openness/SW/Interface/v5">
+  $secInput
+  $secOutput
+  $secInOut
+  $secStatic
+  $secTemp
+  <Section Name="Constant" />
+</Sections></Interface>
+      <IsIECCheckEnabled>false</IsIECCheckEnabled>
+      <MemoryLayout>Optimized</MemoryLayout>
+      <Name>$([System.Security.SecurityElement]::Escape($Name))</Name>
+      <Namespace />
+      <Number>$Number</Number>
+      <ProgrammingLanguage>$ProgrammingLanguage</ProgrammingLanguage>
+      <SetENOAutomatically>false</SetENOAutomatically>
+      <UDABlockProperties />
+      <UDAEnableTagReadback>false</UDAEnableTagReadback>
+    </AttributeList>
+    <ObjectList>
+      <MultilingualText ID="1" CompositionName="Comment">
+        <ObjectList>
+          <MultilingualTextItem ID="2" CompositionName="Items">
+            <AttributeList>
+              <Culture>$Culture</Culture>
+              <Text />
+            </AttributeList>
+          </MultilingualTextItem>
+        </ObjectList>
+      </MultilingualText>
+      <MultilingualText ID="3" CompositionName="Title">
+        <ObjectList>
+          <MultilingualTextItem ID="4" CompositionName="Items">
+            <AttributeList>
+              <Culture>$Culture</Culture>
+              <Text />
+            </AttributeList>
+          </MultilingualTextItem>
+        </ObjectList>
+      </MultilingualText>
+    </ObjectList>
+  </SW.Blocks.FB>
+</Document>
+"@
+    if ($ProgrammingLanguage -match '^(SCL|ST)$') {
+        $unit = @"
+      <SW.Blocks.CompileUnit ID="101" CompositionName="CompileUnits">
+        <AttributeList>
+          <NetworkSource><StructuredText xmlns="http://www.siemens.com/automation/Openness/SW/NetworkSource/StructuredText/v1" UId="110"><Text UId="1110">// generated by TiaPortalSDK</Text></StructuredText></NetworkSource>
+          <ProgrammingLanguage>$ProgrammingLanguage</ProgrammingLanguage>
+        </AttributeList>
+        <ObjectList>
+          <MultilingualText ID="102" CompositionName="Comment">
+            <ObjectList>
+              <MultilingualTextItem ID="103" CompositionName="Items">
+                <AttributeList>
+                  <Culture>$Culture</Culture>
+                  <Text />
+                </AttributeList>
+              </MultilingualTextItem>
+            </ObjectList>
+          </MultilingualText>
+        </ObjectList>
+      </SW.Blocks.CompileUnit>
+"@
+        $xml = $xml.Replace('  </SW.Blocks.FB>', $unit + '  </SW.Blocks.FB>')
+    }
+    return $xml
 }
 
 function New-TiaFB {
@@ -280,16 +525,19 @@ function New-TiaFB {
         [Parameter(Mandatory=$true)]
         [string]$Name,
         [string]$ProgrammingLanguage = 'LAD',
-        [bool]$AutoNumber = $true,
         [int]$Number = 0
     )
-    if (-not $script:Software) { throw "No PLC software." }
-    $blockGroup = Unwrap-PSObject $script:Software.BlockGroup
-    $progLangType = $script:Asm.GetType('Siemens.Engineering.SW.Blocks.ProgrammingLanguage')
-    $lang = [System.Enum]::Parse($progLangType, $ProgrammingLanguage)
-    $fb = $blockGroup.Blocks.CreateFB($Name, $AutoNumber, $Number, $lang)
-    Write-Host "Created FB '$Name'" -ForegroundColor Green
-    return Unwrap-PSObject $fb
+    <#  V21 的 CreateFB 只支持 ProDiag, 这里统一改成"生成 XML -> 导入",
+        V19 / V21 都能用。  #>
+    $xml = New-TiaFbXml -Name $Name -Number $Number -ProgrammingLanguage $ProgrammingLanguage
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("fb_" + [System.Guid]::NewGuid().ToString('N') + ".xml")
+    Write-TiaXmlWithBom -Xml $xml -Path $tmp
+    try {
+        Import-TiaBlock -XmlPath $tmp -Override
+    } finally {
+        if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+    }
+    return Get-TiaBlock -Name $Name
 }
 
 function New-TiaInstanceDB {
@@ -382,7 +630,7 @@ function Export-TiaTagTable {
     if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
     $exportPath = Join-Path $OutputDir "${Name}_tagtable.xml"
     $fi = New-Object System.IO.FileInfo($exportPath)
-    $exportOptionsType = $script:Asm.GetType('Siemens.Engineering.ExportOptions')
+    $exportOptionsType = Get-TiaType('Siemens.Engineering.ExportOptions')
     $option = if ($WithDefaults) { [System.Enum]::Parse($exportOptionsType, 'WithDefaults') } else { [System.Enum]::Parse($exportOptionsType, 'AsInterface') }
     $table.Export($fi, $option)
     Write-Host "Exported tag table '$Name' to $exportPath" -ForegroundColor Green
@@ -397,7 +645,7 @@ function Import-TiaTagTable {
     )
     if (-not $script:Software) { throw "No PLC software." }
     $tagTableGroup = Unwrap-PSObject $script:Software.TagTableGroup
-    $importOptionsType = $script:Asm.GetType('Siemens.Engineering.ImportOptions')
+    $importOptionsType = Get-TiaType('Siemens.Engineering.ImportOptions')
     $option = if ($Override) { [System.Enum]::Parse($importOptionsType, 'Override') } else { [System.Enum]::Parse($importOptionsType, 'Keep') }
     $fi = New-Object System.IO.FileInfo($XmlPath)
     $tagTableGroup.TagTables.Import($fi, $option)
@@ -446,11 +694,14 @@ function Invoke-TiaCompile {
         [string]$BlockName
     )
     if (-not $script:Software) { throw "No PLC software." }
-    $compilableType = $script:Asm.GetType('Siemens.Engineering.Compiler.ICompilable')
+    $compilableType = Get-TiaType('Siemens.Engineering.Compiler.ICompilable')
     $getServiceMethod = $script:Software.GetType().GetMethod('GetService')
     if ($BlockName) {
         $block = Get-TiaBlock -Name $BlockName
-        $compilableBlock = $block.GetService($compilableType)
+        # V21: 不能用 $block.GetService($type) 这种位置参数反射调用(报
+        # "找不到 GetService 的重载，参数计数为 1"), 必须 MakeGenericMethod
+        $gsmB = $block.GetType().GetMethod('GetService')
+        $compilableBlock = Unwrap-PSObject ($gsmB.MakeGenericMethod($compilableType).Invoke($block, $null))
         $result = $compilableBlock.Compile()
     } else {
         $compilableGeneric = $getServiceMethod.MakeGenericMethod($compilableType)
@@ -471,7 +722,7 @@ function Get-TiaOnlineProvider {
         [int]$DeviceIndex = 0
     )
     if (-not $script:Project) { throw "No project open." }
-    $onlineProviderType = $script:Asm.GetType('Siemens.Engineering.Online.OnlineProvider')
+    $onlineProviderType = Get-TiaType('Siemens.Engineering.Online.OnlineProvider')
     $device = Get-TiaDevice -DeviceIndex $DeviceIndex
     foreach ($item in $device.DeviceItems) {
         $realItem = Unwrap-PSObject $item
@@ -488,7 +739,7 @@ function Get-TiaDownloadProvider {
         [int]$DeviceIndex = 0
     )
     if (-not $script:Project) { throw "No project open." }
-    $downloadProviderType = $script:Asm.GetType('Siemens.Engineering.Download.DownloadProvider')
+    $downloadProviderType = Get-TiaType('Siemens.Engineering.Download.DownloadProvider')
     $device = Get-TiaDevice -DeviceIndex $DeviceIndex
     foreach ($item in $device.DeviceItems) {
         $realItem = Unwrap-PSObject $item
@@ -500,6 +751,39 @@ function Get-TiaDownloadProvider {
     throw "Could not get DownloadProvider from device"
 }
 
+function Set-TiaOnlineTargetInterface {
+    param(
+        [int]$DeviceIndex = 0,
+        [string]$PcInterfacePattern = 'PLCSIM'
+    )
+    <#  V21 实测可用: 把在线连接的目标网卡切到指定的 PC 接口,
+        例如 'Siemens PLCSIM Virtual Ethernet Adapter' 或 'Realtek PCIe GbE'.
+        注意: ConfigurationTargetInterface 对象本身只叫 "1 X1", 必须按
+        ConfigurationMode.PcInterfaces 的名字去匹配。
+        实测: ApplyConfiguration 返回 True, IsConfigured 变 True。  #>
+    if (-not $script:Project) { throw 'No project open.' }
+    $op = Get-TiaOnlineProvider -DeviceIndex $DeviceIndex
+    $cfg = $op.Configuration
+    $target = $null
+    foreach ($m in $cfg.Modes) {
+        foreach ($pc in $m.PcInterfaces) {
+            if ($pc.Name -notmatch $PcInterfacePattern) { continue }
+            Write-Host ("  命中 PC 接口: " + $pc.Name)
+            foreach ($pr in $pc.GetType().GetProperties()) {
+                if ($pr.PropertyType.Name -notmatch 'Composition') { continue }   # 按属性类型过滤, 不是属性名
+                try { foreach ($c in $pr.GetValue($pc)) { $target = $c; break } } catch { }
+                if ($target) { break }
+            }
+            if ($target) { break }
+        }
+        if ($target) { break }
+    }
+    if (-not $target) { throw ("没找到匹配 '" + $PcInterfacePattern + "' 的 PC 接口(检查网卡名)") }
+    $ok = $cfg.ApplyConfiguration($target)
+    Write-Host ("在线目标接口 -> '" + $pc.Name + "' / 目标 '" + $target.Name + "'  ApplyConfiguration=" + $ok + "  IsConfigured=" + $cfg.IsConfigured) -ForegroundColor Green
+    return $ok
+}
+
 function Invoke-TiaGoOnline {
     param(
         [int]$DeviceIndex = 0
@@ -508,6 +792,26 @@ function Invoke-TiaGoOnline {
     $state = $provider.GoOnline()
     Write-Host "Online state: $state" -ForegroundColor Cyan
     return $state
+}
+
+function Connect-TiaToPlcsim {
+    param(
+        [int]$DeviceIndex = 0,
+        [string]$PcInterfacePattern = 'PLCSIM'
+    )
+    <#  仿真联机入口: 切换在线网卡到 PLCSIM 虚拟网卡 -> GoOnline ->
+        在线则下载。前提: PLCSIM 已启动且里面已有活动的虚拟 PLC 实例
+        (Openness 没有"启动仿真"接口, 实例要先在 PLCSIM 里建好)。  #>
+    [void](Set-TiaOnlineTargetInterface -DeviceIndex $DeviceIndex -PcInterfacePattern $PcInterfacePattern)
+    $op = Get-TiaOnlineProvider -DeviceIndex $DeviceIndex
+    $st = $op.GoOnline()
+    Write-Host ("GoOnline => " + $st) -ForegroundColor $(if ("$st" -eq 'Online') { 'Green' } else { 'Yellow' })
+    if ("$st" -eq 'Online') {
+        $r = Invoke-TiaDownload -DeviceIndex $DeviceIndex -Options 'Software'
+        Write-Host ("下载 State=" + $r.State + "  Errors=" + $r.ErrorCount + "  Warnings=" + $r.WarningCount)
+        return $r
+    }
+    return $null
 }
 
 function Invoke-TiaGoOffline {
@@ -525,10 +829,33 @@ function Invoke-TiaDownload {
         [string]$Options = 'Software'
     )
     $downloadProvider = Get-TiaDownloadProvider -DeviceIndex $DeviceIndex
-    $downloadOptionsType = $script:Asm.GetType('Siemens.Engineering.Download.DownloadOptions')
-    $option = [System.Enum]::Parse($downloadOptionsType, $Options)
-    $config = $downloadProvider.Configuration
-    $result = $downloadProvider.Download($config, $null, $null, $option)
+    # V21 的 Download 只剩三个重载:
+    #   Download(DirectoryInfo, delegate)
+    #   Download(IConfiguration, pre, post, DownloadOptions)
+    #   Download(IConfiguration, ConfigurationAddress, pre, post, DownloadOptions)
+    # 注意第一参是 IConfiguration, 不是 $provider.Configuration(ConnectionConfiguration),
+    # 直接传后者会报 "找不到 Download 的重载，参数计数为 4"。
+    # 所以这里先试 4 参形式, 不行就回退到最稳的 Download(DirectoryInfo, delegate)。
+    $result = $null
+    try {
+        $downloadOptionsType = Get-TiaType('Siemens.Engineering.Download.DownloadOptions')
+        $option = [System.Enum]::Parse($downloadOptionsType, $Options)
+        $config = $downloadProvider.Configuration
+        $result = $downloadProvider.Download($config, $null, $null, $option)
+    } catch {
+        # V21 的 Download(DirectoryInfo, delegate) 也要求 delegate 非空:
+        #   "The argument 'preDownloadConfigurationDelegate' may not be null."
+        # 从 PowerShell 造 DownloadConfigurationDelegate 很麻烦, 先用 Try/Catch 兜住,
+        # 给出可操作的提示而不是难懂的重载错误。
+        Write-Host ("  下载失败(V21 的 Download 两个重载都要求非空 delegate): " + $_.Exception.Message) -ForegroundColor Red
+        $tmpDir = New-Object System.IO.DirectoryInfo([System.IO.Path]::GetTempPath())
+        try { $result = $downloadProvider.Download($tmpDir, $null) }
+        catch {
+            throw ("V21 下载需要非空的 DownloadConfigurationDelegate 参数, PowerShell 侧无法直接构造。" +
+                   "可行做法: (a) 先 Set-TiaOnlineTargetInterface 并 GoOnline 成功后再下载; " +
+                   "(b) 下载这一步改用 TIA 界面/或写 C# 宿主程序用 `new DownloadConfigurationDelegate(handler)`。原始错误: " + $_.Exception.Message)
+        }
+    }
     Write-Host "Download State: $($result.State)" -ForegroundColor $(if ($result.State -eq 'Error') { 'Red' } else { 'Green' })
     Write-Host "Errors: $($result.ErrorCount), Warnings: $($result.WarningCount)"
     return $result
@@ -637,7 +964,7 @@ function New-TiaTagXml {
     $xml = @"
 <?xml version="1.0" encoding="utf-8"?>
 <Document>
-  <Engineering version="V19" />
+  <Engineering version="$script:XmlVersion" />
   <SW.Tags.PlcTagTable ID="0">
     <AttributeList>
       <Name>$([System.Security.SecurityElement]::Escape($TableName))</Name>
@@ -683,7 +1010,7 @@ function New-TiaGlobalDbXml {
     $xml = @"
 <?xml version="1.0" encoding="utf-8"?>
 <Document>
-  <Engineering version="V19" />
+  <Engineering version="$script:XmlVersion" />
   <SW.Blocks.GlobalDB ID="0">
     <AttributeList>
       <AutoNumber>true</AutoNumber>
@@ -764,7 +1091,7 @@ function New-TiaFcXml {
     $xml = @"
 <?xml version="1.0" encoding="utf-8"?>
 <Document>
-  <Engineering version="V19" />
+  <Engineering version="$script:XmlVersion" />
   <SW.Blocks.FC ID="0">
     <AttributeList>
       <AutoNumber>true</AutoNumber>
@@ -817,6 +1144,33 @@ function New-TiaFcXml {
   </SW.Blocks.FC>
 </Document>
 "@
+    # SCL/ST 必须有至少一个 CompileUnit, 否则导入报
+    # "Language of 'SCL' have to have at least one compile unit."
+    # 注意: xmlns 必须挂在 StructuredText 上; 挂到 NetworkSource 上会被拒(实测 V21):
+    #   "Attribute 'NetworkSource' does not support xml attribute 'xmlns'"
+    if ($ProgrammingLanguage -match '^(SCL|ST)$') {
+        $unit = @"
+      <SW.Blocks.CompileUnit ID="101" CompositionName="CompileUnits">
+        <AttributeList>
+          <NetworkSource><StructuredText xmlns="http://www.siemens.com/automation/Openness/SW/NetworkSource/StructuredText/v1" UId="110"><Text UId="1110">// generated by TiaPortalSDK</Text></StructuredText></NetworkSource>
+          <ProgrammingLanguage>$ProgrammingLanguage</ProgrammingLanguage>
+        </AttributeList>
+        <ObjectList>
+          <MultilingualText ID="102" CompositionName="Comment">
+            <ObjectList>
+              <MultilingualTextItem ID="103" CompositionName="Items">
+                <AttributeList>
+                  <Culture>$Culture</Culture>
+                  <Text />
+                </AttributeList>
+              </MultilingualTextItem>
+            </ObjectList>
+          </MultilingualText>
+        </ObjectList>
+      </SW.Blocks.CompileUnit>
+"@
+        $xml = $xml.Replace('  </SW.Blocks.FC>', $unit + '  </SW.Blocks.FC>')
+    }
     return $xml
 }
 
@@ -850,19 +1204,24 @@ function Get-TiaBlockInterface {
         [Parameter(Mandatory=$true)]
         [string]$Name
     )
+    <#  V21 起 FC/OB 不再暴露 .Interface 属性($block.Interface 为 $null),
+        改为"导出 XML -> 解析 Member", V19/V21 通用。  #>
     $block = Get-TiaBlock -Name $Name
-    $interface = Unwrap-PSObject $block.Interface
-    $ns = 'http://www.siemens.com/automation/Openness/SW/Interface/v5'
-    $xmlReader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($interface.Text))
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("iface_" + [System.Guid]::NewGuid().ToString('N') + ".xml")
+    $exportOptionsType = Get-TiaType('Siemens.Engineering.ExportOptions')
+    $opt = [System.Enum]::Parse($exportOptionsType, 'WithDefaults')
+    $block.Export((New-Object System.IO.FileInfo($tmp)), $opt)
     $members = @()
-    while ($xmlReader.Read()) {
-        if ($xmlReader.NodeType -eq [System.Xml.XmlNodeType]::Element -and $xmlReader.Name -eq 'Member') {
-            $name = $xmlReader.GetAttribute('Name')
-            $datatype = $xmlReader.GetAttribute('Datatype')
-            if ($name) { $members += [PSCustomObject]@{ Name = $name; Datatype = $datatype } }
+    try {
+        [xml]$doc = [System.IO.File]::ReadAllText($tmp, [System.Text.Encoding]::UTF8)
+        foreach ($n in $doc.SelectNodes('//*[local-name()="Member"]')) {
+            $nm = $n.GetAttribute('Name')
+            $dt = $n.GetAttribute('Datatype')
+            if ($nm) { $members += [PSCustomObject]@{ Name = $nm; Datatype = $dt } }
         }
+    } finally {
+        if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
     }
-    $xmlReader.Close()
     return $members
 }
 
@@ -887,8 +1246,18 @@ function New-TiaForceTable {
         [Parameter(Mandatory=$true)]
         [string]$Name
     )
+    <#  V21: PlcForceTableComposition 只有 Import/Find, 没有 Create
+        (监视表 PlcWatchTableComposition 仍有 Create)。  #>
     $wfGroup = Get-TiaWatchAndForceTableGroup
-    $ft = $wfGroup.ForceTables.Create($Name)
+    $ftComp = $wfGroup.ForceTables
+    $hasCreate = $false
+    foreach ($m in $ftComp.GetType().GetMethods()) { if ($m.Name -eq 'Create') { $hasCreate = $true } }
+    if (-not $hasCreate) {
+        throw ("Openness V21 的 PlcForceTableComposition 没有 Create 方法(只有 Import/Find) —— " +
+               "力表不能用 Create 新建, 请用 ForceTables.Import(FileInfo, ImportOptions) 从 XML 导入, " +
+               "或在 TIA 界面手工创建。")
+    }
+    $ft = $ftComp.Create($Name)
     Write-Host "Created force table '$Name'" -ForegroundColor Green
     return Unwrap-PSObject $ft
 }
@@ -927,11 +1296,29 @@ function Invoke-TiaArchive {
         [string]$Mode = 'Compressed'
     )
     if (-not $script:Project) { throw "No project open." }
-    $archivationModeType = $script:Asm.GetType('Siemens.Engineering.ProjectArchivationMode')
+    # V21 要求归档前没有未保存改动, 否则报:
+    #   "Operation is not possible while project has unsaved changes"
+    try { $script:Project.Save() } catch { }
+    if (-not (Test-Path $TargetDirectory)) { New-Item -ItemType Directory -Path $TargetDirectory -Force | Out-Null }
+    # 目标已存在时 TIA 的报错很含糊, 这里提前拦下:
+    #   "Archive Operation is not possible as the target file/folder ... is already exist"
+    # 最常见的触发原因: 归档名和工程目录同名且在同一个父目录下。
+    $collide = Join-Path $TargetDirectory $ArchiveName
+    if (Test-Path $collide) {
+        throw ("归档目标 '$collide' 已存在(常见于归档名与工程目录同名/同处)。换个目录或换个归档名。")
+    }
+    $archivationModeType = Get-TiaType('Siemens.Engineering.ProjectArchivationMode')
     $modeValue = [System.Enum]::Parse($archivationModeType, $Mode)
     $targetDir = New-Object System.IO.DirectoryInfo($TargetDirectory)
     $script:Project.Archive($targetDir, $ArchiveName, $modeValue)
-    Write-Host "Project archived to $TargetDirectory\$ArchiveName.zap19" -ForegroundColor Green
+    # 注意: V21 的归档产物就叫 <ArchiveName>, 不带扩展名(V19 是 .zap19)
+    $made = Join-Path $TargetDirectory $ArchiveName
+    if (-not (Test-Path $made)) {
+        $alt = Join-Path $TargetDirectory ("$ArchiveName.$($script:ArchiveExt)")
+        if (Test-Path $alt) { $made = $alt }
+    }
+    Write-Host "Project archived to $made" -ForegroundColor Green
+    return $made
 }
 
 function Restore-TiaProject {
@@ -942,9 +1329,18 @@ function Restore-TiaProject {
         [string]$TargetDirectory
     )
     if (-not $script:TiaPortal) { throw "Not connected." }
-    $archiveFi = New-Object System.IO.FileInfo($ArchivePath)
+    # V21 归档不带扩展名, V19 是 .zap19 —— 两种都试
+    $path = $ArchivePath
+    if (-not (Test-Path $path)) {
+        $alt1 = "$ArchivePath.$($script:ArchiveExt)"
+        if (Test-Path $alt1) { $path = $alt1 }
+    }
+    if (-not (Test-Path $path)) { throw "归档文件不存在: $ArchivePath" }
+    if (-not (Test-Path $TargetDirectory)) { New-Item -ItemType Directory -Path $TargetDirectory -Force | Out-Null }
+    $archiveFi = New-Object System.IO.FileInfo($path)
     $restoreDir = New-Object System.IO.DirectoryInfo($TargetDirectory)
-    $projects = Unwrap-PSObject $script:TiaPortal.Projects
+    # 集合不要 Unwrap(PowerShell 函数返回会展开集合)
+    $projects = $script:TiaPortal.Projects
     $script:Project = $projects.Retrieve($archiveFi, $restoreDir)
     Write-Host "Project retrieved: $($script:Project.Name)" -ForegroundColor Green
     return $script:Project
@@ -955,12 +1351,16 @@ function Get-TiaBlockReferences {
         [Parameter(Mandatory=$true)]
         [string]$Name
     )
+    <#  V21: FC/FB/OB 全都没有 GetReferences 方法了(V19 有)。
+        V21 请改用 Siemens.Engineering.CrossReference 命名空间。  #>
     $block = Get-TiaBlock -Name $Name
+    if (-not $block.GetType().GetMethod('GetReferences')) {
+        throw ("Openness V21 已移除 GetReferences (" + $block.GetType().Name + " 上没有此方法)。" +
+               "V21 请用 Siemens.Engineering.CrossReference 命名空间(CrossReferenceProvider / CrossReferenceComposition)。")
+    }
     $refs = $block.GetReferences()
     $result = @()
-    foreach ($ref in $refs) {
-        $result += $ref.ToString()
-    }
+    foreach ($ref in $refs) { $result += $ref.ToString() }
     return $result
 }
 
@@ -971,24 +1371,32 @@ function Find-TiaProjects {
     )
     if (-not $SearchDirs) {
         $SearchDirs = @(
+            'D:\工作',
             'D:\work',
-            'D:\new folder',
             'D:\Projects',
+            'D:\Siemens',
+            'D:\SeedBox_Project',
+            'D:\new folder',
             [System.IO.Path]::Combine($env:USERPROFILE, 'Documents', 'Automation')
         )
     }
     $results = @()
+    # 按本机实际安装的版本决定扫描哪些工程扩展名 (ap19 / ap21 ...)
+    $exts = @('.ap19', '.ap20', '.ap21')
+    $detected = @(Get-TiaInstallations)
+    if ($detected) { $exts = @($detected | ForEach-Object { '.ap' + $_.Version }) }
     foreach ($dir in $SearchDirs) {
         if (Test-Path $dir) {
-            Write-Host "Scanning: $dir" -ForegroundColor DarkGray
-            Get-ChildItem -Path $dir -Filter '*.ap19' -Recurse -ErrorAction SilentlyContinue -Depth $MaxDepth | ForEach-Object {
-                $results += [PSCustomObject]@{
-                    FullName = $_.FullName
-                    Directory = $_.Directory.Name
-                    LastModified = $_.LastWriteTime
-                    SizeKB = [math]::Round($_.Length / 1KB, 1)
+            Write-Host "Scanning: $dir  ($($exts -join ', '))" -ForegroundColor DarkGray
+            Get-ChildItem -Path $dir -Recurse -Depth $MaxDepth -File -ErrorAction SilentlyContinue |
+                Where-Object { $exts -contains $_.Extension } | ForEach-Object {
+                    $results += [PSCustomObject]@{
+                        FullName = $_.FullName
+                        Directory = $_.Directory.Name
+                        LastModified = $_.LastWriteTime
+                        SizeKB = [math]::Round($_.Length / 1KB, 1)
+                    }
                 }
-            }
         }
     }
     return $results | Sort-Object LastModified -Descending
