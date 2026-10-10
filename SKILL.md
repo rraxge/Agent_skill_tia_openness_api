@@ -1026,7 +1026,7 @@ $userTypeType = $asm.GetType('Siemens.Engineering.Online.Configurations.UserType
 
 ### Simulation Workflow (S7-PLCSIM V19)
 
-Since V19 has no dedicated simulation API, follow this workflow. 本机**未安装 PLCSIM Advanced**（原 `Siemens.Simulation.Exe` 路径不存在）；已安装 **S7-PLCSIM V19** 和 **S7-PLCSIM V21**（分别在 `C:\Program Files\Siemens\Automation\PLCSIM_V19\` 与 `...\PLCSIM_V21\`，用与 TIA 同版本的那个）。
+Since V19 has no dedicated simulation API, follow this workflow. 本机实测（V21 环境）：标准 S7-PLCSIM V19 / V21 已装（在 `C:\Program Files\Siemens\Automation\PLCSIM_V19|V21\`，用与 TIA 同版本的那个）；**PLCSIM Advanced V8.0 也已安装**（`C:\Program Files (x86)\Siemens\Automation\PLCSIMADV\`）。
 
 1. **Start PLCSIM** manually or via command line（V21 用 `S7PLCSIMV21.exe`）:
    ```powershell
@@ -1369,6 +1369,159 @@ Set-TiaOnlineTargetInterface -PcInterfacePattern 'PLCSIM'
 给已有站点加扩展模块，Openness 侧只有 `DeviceItemComposition.CreateFrom(MasterCopy)` 一条路（需要库主副本），否则就在 TIA 界面里加。
 
 **另注**：`Get-TiaBlock -Name xxx` 在块不存在时是**抛异常**而不是返回 `$null`，写脚本时要用 try/catch。
+
+## 仿真：Openness 与 PLCSIM Advanced 的分工（本机实测）
+
+**结论：Openness 自己确实不能启动仿真，但 PLCSIM Advanced 有自己的 API，可以从脚本里直接调。**
+
+### Openness 侧：没有任何启动仿真的接口
+
+对 V21 的 8 个程序集做全量反射，仿真相关只有两个**编译期**开关，没有 CreateInstance / PowerOn / StartSim 之类：
+
+| 类型 | 唯一成员 |
+|---|---|
+| `Siemens.Engineering.SW.PlcSimulationSettingsProvider` | `IsSimulationDuringBlockCompilationEnabled` |
+| `Siemens.Engineering.SW.VirtualPlcSettingsProvider` | `IsVirtualPlcDuringBlockCompilationEnabled` |
+
+### PLCSIM Advanced 侧：API 可脚本化（实测可加载、可建实例）
+
+API 是 .NET 程序集，PowerShell 直接 `LoadFrom` 就能用：
+
+```powershell
+$dll = 'C:\Program Files (x86)\Common Files\Siemens\PLCSIMADV\API\8.0\Siemens.Simatic.Simulation.Runtime.Api.x64.dll'
+$asm = [System.Reflection.Assembly]::LoadFrom($dll)
+$NS  = 'Siemens.Simatic.Simulation.Runtime.'
+$mgrType = $asm.GetType($NS + 'SimulationRuntimeManager')
+$mgr = $mgrType.GetProperty('LocalRuntimeManagerInstance').GetValue($null)   # 会自动拉起 Runtime.Manager.exe
+$cpu = [System.Enum]::Parse($asm.GetType($NS + 'ECPUType'), 'CPU1214C_DCDCDC')
+$inst = $mgr.RegisterInstance($cpu, 'MySim')     # 建虚拟 PLC
+$inst.PowerOn(60000)                            # 上电(需授权)
+$inst.Run(); $inst.Stop(); $inst.PowerOff(); $inst.UnregisterInstance()
+```
+
+`IInstance` 还能: 读写 `InputArea`/`OutputArea`/`MarkerArea`、按名字读写 `TagInfos`、`SetIPSuite` 设 IP、`ArchiveStorage`/`RetrieveStorage` 存档。**注意: 下载仍由 TIA/Openness 做**（API 里没有 Download）。
+
+### V8.0 支持的仿真 CPU 型号（反射 ECPUType 得到）
+
+| 系列 | 型号 |
+|---|---|
+| S7-1500 | 1511/1513/1515/1516/1517/1518 及 F/T 变体、1511C/1512C、RH 系列 |
+| ET200SP / ET200pro | 1510SP … 1514SPT、1512PRO 等 |
+| 软件/开放控制器 | 1505SP/1507S/1508S 等及 F/T 变体 |
+| SINUMERIK | MCU1720 / NCU1740/1750/1760 / PPU1740 |
+| **S7-1200 G2** | 1212C / **1214C（`6ES7 214-1AH50-0XB0`）** / 1216 / 1217 及 F 变体 |
+
+⚠️ **经典 S7-1200（1215C、老 1214C `6ES7 214-1AG40-0XB0`）不在 Advanced 支持范围内** —— 那只能靠标准 S7-PLCSIM，而标准版没有 API。要全自动仿真，CPU 必须是 S7-1500 或 S7-1200 **G2**。
+
+### 本机实测撞到的墙：`LicenseNotFound`
+
+`RegisterInstance` 成功、`PowerOn()` 抛 **`Error Code: -30, LicenseNotFound`** —— PLCSIM Advanced 是**独立授权**产品，STEP 7 / WinCC 的授权不算（本机 AX NF ZZ 里只有标准版 PLCSIM 的 key：`SIFLA1PLCS220504`/`SIFLA1PLCS1900`/`SISLA1PLCS2100`）。西门子官方提供 21 天试用。
+
+### 完整的自动化仿真链条
+
+1. PLCSIM Advanced API：建实例 + 上电（需授权）
+2. Openness：`Set-TiaOnlineTargetInterface -PcInterfacePattern 'PLCSIM'` 切到 PLCSIM 虚拟网卡
+3. Openness：`GoOnline` → `Download`（**必须 Software 范围**，Hardware 会因虚拟硬件不匹配而失败）
+4. 验证：Advanced API 读写 `TagInfos` / `InputArea`，或 Openness 的监视表
+
+## 手工生成 LAD (FlgNet v5) —— 实测通过
+
+**权威参考就在本机**：`<TIA安装目录>\PublicAPI\<版本>\Schemas\*.xsd`
+（`SW.PlcBlocks.LADFBD_v5.xsd`、`SW.PlcBlocks.Access_v5.xsd`、`SW.PlcBlocks.SCL_v4.xsd` …）。
+**不要猜格式，直接查 XSD** —— 这比反复试导入快得多。
+
+### 网络骨架
+
+```xml
+<SW.Blocks.CompileUnit ID="101" CompositionName="CompileUnits">
+  <AttributeList>
+    <NetworkSource>
+      <FlgNet xmlns="http://www.siemens.com/automation/Openness/SW/NetworkSource/FlgNet/v5">
+        <Parts>…</Parts><Wires>…</Wires>
+      </FlgNet>
+    </NetworkSource>
+    <ProgrammingLanguage>LAD</ProgrammingLanguage>
+  </AttributeList>
+  <ObjectList>…Comment / Title…</ObjectList>
+</SW.Blocks.CompileUnit>
+```
+
+### 建模规则（逐条都是实测撞出来的）
+
+| 规则 | 说明 / 踩坑报错 |
+|---|---|
+| **一网络只能有一根电源轨连线** | 一根 `<Wire>` 带 `<Powerrail/>` + **多个落点** = 并联支路；拆成多根轨线报 `输出口只能接一个电源轨` |
+| 串联 | 前一元件 `out` → 后一元件 `in`，逐条 Wire |
+| 并联汇合 | 各支路 `out` → `O` 块的 `in1..inN`；`<TemplateValue Name="Card" Type="Cardinality">N</TemplateValue>` |
+| 常闭触点 | `<Part Name="Contact" UId=""><Negated Name="operand" /></Part>` |
+| 线圈 | `Coil` / `SCoil`(置位) / `RCoil`(复位)，脚位 `in` + `operand` |
+| 定时器 | `<Part Name="TON" Version="1.0" UId=""><Instance Scope="LocalVariable" UId=""><Component Name="IEC_Timer_0_Instance" /></Instance><TemplateValue Name="time_type" Type="Type">Time</TemplateValue></Part>`，脚位 `IN` / `PT` / `Q` / `ET` |
+| 上升沿 | `<Part Name="PBox" />`，脚位 `in` / `bit`(边沿位) / `out` |
+| **空闲引脚必须配 `<OpenCon/>`** | `<Wire><NameCon UId="ton" Name="ET" /><OpenCon UId="x" /></Wire>`。不写报 `connection ET is not connected`；只写 NameCon 报 `A rung must have at least two connections` |
+| **ID 必须唯一** | CompileUnit 的 `ID` 与块内所有 `MultilingualText` 的 `ID` 不能撞，否则 `Duplicate Simatic ML ID` |
+
+> 解析 TIA 导出件时注意：空闲引脚那条 Wire 的第二个元素是 **`<OpenCon>`**，别只匹配 NameCon/IdentCon/Powerrail 而漏掉它（漏了会误判“单元素 Wire 合法”）。
+
+### 块内静态量（定时器实例 / 边沿位）
+
+定时器实例声明在 FB 的 Static 段，`TON_TIME` **必须带展开的子成员**：
+
+```xml
+<Member Name="IEC_Timer_0_Instance" Datatype="TON_TIME" Version="1.0" Remanence="NonRetain" Accessibility="Public">
+  <AttributeList>
+    <BooleanAttribute Name="ExternalAccessible" SystemDefined="true">true</BooleanAttribute>
+    <BooleanAttribute Name="ExternalVisible" SystemDefined="true">true</BooleanAttribute>
+    <BooleanAttribute Name="ExternalWritable" SystemDefined="true">true</BooleanAttribute>
+    <BooleanAttribute Name="SetPoint" SystemDefined="true">true</BooleanAttribute>
+  </AttributeList>
+  <Sections><Section Name="None">
+    <Member Name="PT" Datatype="Time" /><Member Name="ET" Datatype="Time" />
+    <Member Name="IN" Datatype="Bool" /><Member Name="Q" Datatype="Bool" />
+  </Section></Sections>
+</Member>
+```
+
+边沿位（PBox 的 `bit`）就是普通 Static `Bool`。
+
+### 调用 FB / FC（OB、FC 里）
+
+**`<Call>` 是 `<Parts>` 里的独立元素，不是 `<Part Name="Call">`**：
+
+```xml
+<Parts>
+  <Call UId="20001">
+    <CallInfo Name="FB_Conveyor" BlockType="FB">   <!-- BlockType 必填: DB|FB|FC|OB|UDT|FBT|FCT -->
+      <Instance Scope="GlobalVariable" UId="20002"><Component Name="Conv1_DB" /></Instance>
+      <Parameter Name="Start" Section="Input"  Type="Bool" />
+      <Parameter Name="Run"   Section="Output" Type="Bool" />
+      <!-- 每个要用的参数都要声明 -->
+    </CallInfo>
+  </Call>
+</Parts>
+<Wires>
+  <Wire><Powerrail /><NameCon UId="20001" Name="en" /></Wire>
+  <Wire><IdentCon UId="20018" /><NameCon UId="20001" Name="Start" /></Wire>  <!-- 输入: 操作数 -> 引脚 -->
+  <Wire><NameCon UId="20001" Name="Run" /><IdentCon UId="20036" /></Wire>    <!-- 输出: 引脚 -> 操作数 -->
+  <Wire><NameCon UId="20001" Name="Alarm" /><OpenCon UId="20050" /></Wire>   <!-- 不用的也要 OpenCon -->
+</Wires>
+```
+
+三个坑：
+
+1. `<Part Name="Call">` 报 `An instruction with the name 'Call' cannot be found`；`<Part>` 里放 `<CallInfo>` 报模式不符（`Part` 只允许 Equation/Instance/TemplateValue/…）。
+2. **每个声明的参数都必须连上**，否则报 `The connection with the name '<N>' is not connected` —— 报的 **N 是参数在 FB 接口里的序号，不是参数名**，很容易被带偏。
+3. 连线引用的是 **Call 的 UId**，不是 `<Parameter>` 的 UId（用参数 UId 报 `The part with UId 'xxx' does not exist`）。
+
+### 生成器
+
+`scripts/lad_gen.py` —— Python 的 LAD 网络构造器（`contact/series/or_block/coil/part/rail_pin`），
+比在 PowerShell 里拼字符串省事，见文件头注释。
+
+### 验证套路
+
+导入后**让 TIA 再导出一次**，用脚本比对“网络数 / 每网络的元件清单 / 连线数 / 电源轨数”：
+一致即证明 TIA 真把它读成了结构化梯形图。
+（SCL 就是反面教材：导入后回读发现所有源码被拼进一个 `<Text>`。）
 
 ## V19 API Type Quick Reference
 
